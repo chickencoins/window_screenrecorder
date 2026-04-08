@@ -93,7 +93,9 @@ class VideoPreviewWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.frames: list = []
+        self._editor = None  # VideoEditor 참조 (디스크 모드 지원)
+        self.frames: list = []  # RAM 모드 호환용
+        self._frame_count: int = 0
         self.start_marker: int = -1
         self.end_marker: int = -1
 
@@ -157,15 +159,29 @@ class VideoPreviewWidget(QWidget):
 
         layout.addLayout(marker_layout)
 
-    def set_frames(self, frames: list, fps: int = 30):
-        """프레임 리스트 설정 및 UI 업데이트."""
-        self.frames = frames
+    def set_editor(self, editor):
+        """VideoEditor 참조 설정 (디스크 모드 지원)."""
+        self._editor = editor
+
+    def set_frames(self, frames, fps: int = 30):
+        """
+        프레임 소스 설정 및 UI 업데이트.
+        frames: 리스트 또는 프레임 개수(int, 에디터 모드에서 사용).
+        """
         self.fps = fps
         self.start_marker = -1
         self.end_marker = -1
 
-        if frames:
-            self.timeline_slider.setMaximum(len(frames) - 1)
+        if isinstance(frames, int):
+            # 프레임 개수만 전달 (디스크 모드: 에디터에서 get_frame으로 접근)
+            self.frames = []
+            self._frame_count = frames
+        else:
+            self.frames = frames
+            self._frame_count = len(frames)
+
+        if self._frame_count > 0:
+            self.timeline_slider.setMaximum(self._frame_count - 1)
             self.timeline_slider.setValue(0)
             self.timeline_slider.setEnabled(True)
             self.btn_mark_start.setEnabled(True)
@@ -194,16 +210,27 @@ class VideoPreviewWidget(QWidget):
         return (self.start_marker, self.end_marker)
 
     def _on_slider_changed(self, value: int):
-        if 0 <= value < len(self.frames):
+        if 0 <= value < self._frame_count:
             self._display_frame(value)
             self.position_changed.emit(value)
 
+    def _get_frame(self, index: int) -> np.ndarray:
+        """에디터 또는 로컬 리스트에서 프레임 가져오기."""
+        if self._editor is not None:
+            return self._editor.get_frame(index)
+        if 0 <= index < len(self.frames):
+            return self.frames[index]
+        return None
+
     def _display_frame(self, index: int):
         """프레임을 QPixmap으로 변환하여 표시."""
-        if index < 0 or index >= len(self.frames):
+        if index < 0 or index >= self._frame_count:
             return
 
-        frame = self.frames[index]
+        frame = self._get_frame(index)
+        if frame is None:
+            return
+
         h, w, ch = frame.shape
         bytes_per_line = ch * w
 
@@ -221,7 +248,7 @@ class VideoPreviewWidget(QWidget):
         self.frame_label.setPixmap(scaled)
 
         # 정보 업데이트
-        total = len(self.frames)
+        total = self._frame_count
         self.frame_counter.setText(f"프레임: {index + 1} / {total}")
         time_sec = index / max(1, self.fps)
         total_sec = total / max(1, self.fps)

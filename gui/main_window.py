@@ -56,6 +56,7 @@ class MainWindow(QMainWindow):
         self._loaded_clip_frames: list = None  # 삽입용 불러온 클립
 
         self._init_ui()
+        self.preview.set_editor(self.editor)
         self._connect_signals()
         self._update_ui_state()
 
@@ -96,6 +97,26 @@ class MainWindow(QMainWindow):
         self.chk_cursor = QCheckBox("마우스 커서 포함")
         self.chk_cursor.setChecked(True)
         settings_layout.addWidget(self.chk_cursor, 0, 2)
+
+        # 디스크 버퍼 모드
+        self.chk_disk_mode = QCheckBox("디스크 버퍼 (장시간 녹화)")
+        self.chk_disk_mode.setToolTip(
+            "프레임을 RAM 대신 디스크에 저장합니다.\n"
+            "장시간 녹화 시 메모리 부족을 방지하지만 약간 느릴 수 있습니다."
+        )
+        self.chk_disk_mode.setChecked(False)
+        settings_layout.addWidget(self.chk_disk_mode, 0, 3)
+
+        # JPEG 품질 (디스크 모드용)
+        settings_layout.addWidget(QLabel("JPEG 품질:"), 2, 2)
+        self.spin_jpeg_quality = QSpinBox()
+        self.spin_jpeg_quality.setRange(50, 100)
+        self.spin_jpeg_quality.setValue(95)
+        self.spin_jpeg_quality.setToolTip(
+            "디스크 버퍼 모드에서 JPEG 저장 품질 (50-100).\n"
+            "높을수록 화질 좋지만 디스크 사용량 증가."
+        )
+        settings_layout.addWidget(self.spin_jpeg_quality, 2, 3)
 
         # 타이머 모드
         settings_layout.addWidget(QLabel("타이머:"), 1, 0)
@@ -303,6 +324,8 @@ class MainWindow(QMainWindow):
         self.chk_cursor.setEnabled(not recording)
         self.combo_timer_mode.setEnabled(not recording)
         self.spin_timer.setEnabled(not recording)
+        self.chk_disk_mode.setEnabled(not recording)
+        self.spin_jpeg_quality.setEnabled(not recording)
 
     # ─────────────────── 영역 선택 ───────────────────
 
@@ -366,9 +389,14 @@ class MainWindow(QMainWindow):
     def _start_recording(self):
         fps = self.spin_fps.value()
         capture_cursor = self.chk_cursor.isChecked()
-        self.recorder.start_recording(self._region, fps, capture_cursor)
+        disk_mode = self.chk_disk_mode.isChecked()
+        jpeg_quality = self.spin_jpeg_quality.value()
+        self.recorder.start_recording(
+            self._region, fps, capture_cursor, disk_mode, jpeg_quality
+        )
+        mode_str = "디스크 버퍼" if disk_mode else "메모리"
         self._set_state(self.STATE_RECORDING)
-        self.statusBar().showMessage("녹화 중...")
+        self.statusBar().showMessage(f"녹화 중... ({mode_str} 모드)")
 
     def _on_pause(self):
         if self._state == self.STATE_RECORDING:
@@ -392,19 +420,37 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_recording_finished(self):
-        frames = self.recorder.frames
-        if frames:
-            fps = self.spin_fps.value()
-            self.editor.set_frames(frames, fps)
-            self.preview.set_frames(self.editor.frames, fps)
-            mem = self.editor.get_estimated_memory_mb()
-            self._set_state(self.STATE_HAS_FRAMES)
-            self.statusBar().showMessage(
-                f"녹화 완료: {len(frames)}프레임 (메모리: {mem:.0f}MB)"
-            )
+        fps = self.spin_fps.value()
+
+        if self.recorder.is_disk_mode and self.recorder.disk_buffer:
+            # 디스크 버퍼 모드
+            disk_buffer = self.recorder.disk_buffer
+            count = disk_buffer.get_frame_count()
+            if count > 0:
+                self.editor.set_disk_buffer(disk_buffer, fps)
+                self.preview.set_frames(count, fps)
+                disk_mb = self.editor.get_estimated_memory_mb()
+                self._set_state(self.STATE_HAS_FRAMES)
+                self.statusBar().showMessage(
+                    f"녹화 완료: {count}프레임 (디스크: {disk_mb:.0f}MB)"
+                )
+            else:
+                self._set_state(self.STATE_IDLE)
+                self.statusBar().showMessage("녹화된 프레임이 없습니다")
         else:
-            self._set_state(self.STATE_IDLE)
-            self.statusBar().showMessage("녹화된 프레임이 없습니다")
+            # RAM 모드
+            frames = self.recorder.frames
+            if frames:
+                self.editor.set_frames(frames, fps)
+                self.preview.set_frames(self.editor.frames, fps)
+                mem = self.editor.get_estimated_memory_mb()
+                self._set_state(self.STATE_HAS_FRAMES)
+                self.statusBar().showMessage(
+                    f"녹화 완료: {len(frames)}프레임 (메모리: {mem:.0f}MB)"
+                )
+            else:
+                self._set_state(self.STATE_IDLE)
+                self.statusBar().showMessage("녹화된 프레임이 없습니다")
 
     @pyqtSlot(int)
     def _on_frame_count_updated(self, count: int):
@@ -446,7 +492,7 @@ class MainWindow(QMainWindow):
             frames, fps = self.editor.load_video(path)
             self.editor.set_frames(frames, fps)
             self.spin_fps.setValue(fps)
-            self.preview.set_frames(self.editor.frames, fps)
+            self._refresh_preview()
             self._set_state(self.STATE_HAS_FRAMES)
             self.statusBar().showMessage(
                 f"영상 불러옴: {len(frames)}프레임, {fps}fps"
@@ -492,7 +538,7 @@ class MainWindow(QMainWindow):
             return
 
         self.editor.insert_frames(pos, self._loaded_clip_frames)
-        self.preview.set_frames(self.editor.frames, self.editor.fps)
+        self._refresh_preview()
         # 삽입 후 삽입된 위치로 이동
         self.preview.timeline_slider.setValue(pos)
         self.statusBar().showMessage(f"{count}프레임 삽입됨 (위치: {pos})")
@@ -523,16 +569,26 @@ class MainWindow(QMainWindow):
 
         deleted = self.editor.delete_segment(start, end)
         if self.editor.get_frame_count() > 0:
-            self.preview.set_frames(self.editor.frames, self.editor.fps)
+            self._refresh_preview()
             new_pos = min(start, self.editor.get_frame_count() - 1)
             self.preview.timeline_slider.setValue(new_pos)
             self.statusBar().showMessage(f"{deleted}프레임 삭제됨")
         else:
-            self.preview.set_frames([])
+            self.preview.set_frames(0)
             self._set_state(self.STATE_IDLE)
             self.statusBar().showMessage("모든 프레임이 삭제되었습니다")
 
         self._update_ui_state()
+
+    # ─────────────────── 프리뷰 갱신 ───────────────────
+
+    def _refresh_preview(self):
+        """에디터 상태에 맞춰 프리뷰 갱신."""
+        count = self.editor.get_frame_count()
+        if self.editor.disk_mode:
+            self.preview.set_frames(count, self.editor.fps)
+        else:
+            self.preview.set_frames(self.editor.frames, self.editor.fps)
 
     # ─────────────────── 저장 ───────────────────
 
@@ -573,8 +629,11 @@ class MainWindow(QMainWindow):
 
         gif_scale = self.spin_gif_scale.value() if fmt == "gif" else 1.0
 
+        # 디스크 모드에서는 프레임을 하나씩 로드하여 전달
+        frames = self.editor.get_all_frames()
+
         self.exporter.export(
-            self.editor.frames,
+            frames,
             self.editor.fps,
             path,
             fmt,
@@ -614,4 +673,6 @@ class MainWindow(QMainWindow):
                 return
             self.recorder.stop()
 
+        # 디스크 버퍼 정리
+        self.editor.clear()
         event.accept()
